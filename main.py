@@ -1,8 +1,8 @@
 diff --git a/main.py b/main.py
-index 2d850bd1b9e62aea9dbe1f8a9d75bc9ba99ec86a..d0dd3fdb5ca2912dd9843d82b68d17dc929c76d0 100644
+index 2d850bd1b9e62aea9dbe1f8a9d75bc9ba99ec86a..45fb4279864079eda51b0246b6dfa1e8c1b2c15f 100644
 --- a/main.py
 +++ b/main.py
-@@ -1,362 +1,300 @@
+@@ -1,362 +1,315 @@
  import json
 +import os
  import sqlite3
@@ -106,6 +106,21 @@ index 2d850bd1b9e62aea9dbe1f8a9d75bc9ba99ec86a..d0dd3fdb5ca2912dd9843d82b68d17dc
 -        direction TEXT,
 -        updated_at TEXT
 +
++    # Lightweight migration path for older deployed DBs:
++    # if the table already exists without these columns, add them.
++    cur.execute("PRAGMA table_info(scalp_signals)")
++    existing_cols = {row["name"] for row in cur.fetchall()}
++
++    required_cols = {
++        "external_signal_id": "TEXT",
++        "claimed_at": "TEXT",
++        "processed_at": "TEXT",
++    }
++
++    for col_name, col_type in required_cols.items():
++        if col_name not in existing_cols:
++            cur.execute(f"ALTER TABLE scalp_signals ADD COLUMN {col_name} {col_type}")
++
 +    cur.execute(
 +        """
 +        CREATE TABLE IF NOT EXISTS webhook_log (
@@ -191,12 +206,12 @@ index 2d850bd1b9e62aea9dbe1f8a9d75bc9ba99ec86a..d0dd3fdb5ca2912dd9843d82b68d17dc
 -    if not row:
 -        return dict(DEFAULT_BIAS)
 -    return dict(row)
--
+ 
  
 -@app.get("/")
 -def root():
 -    return {"ok": True, "service": "paul_railway_backend_v3"}
- 
+-
 +def validate_scalp_payload(data: dict):
 +    message_type = str(data.get("message_type", "")).strip()
 +    if message_type != "scalp_signal":
@@ -228,9 +243,7 @@ index 2d850bd1b9e62aea9dbe1f8a9d75bc9ba99ec86a..d0dd3fdb5ca2912dd9843d82b68d17dc
 -    h1 = str(data.get("h1", "")).strip().lower()
 -    daily_bias = str(data.get("daily_bias", "")).strip().lower()
 -    direction = str(data.get("direction", "")).strip().lower()
-+    if sl_distance <= 0 or tp_distance <= 0:
-+        return False, "non_positive_distance"
- 
+-
 -    if h4 not in {"bullish", "bearish"}:
 -        return JSONResponse({"ok": False, "reason": "bad_h4"}, status_code=400)
 -    if h1 not in {"bullish", "bearish"}:
@@ -239,8 +252,7 @@ index 2d850bd1b9e62aea9dbe1f8a9d75bc9ba99ec86a..d0dd3fdb5ca2912dd9843d82b68d17dc
 -        return JSONResponse({"ok": False, "reason": "bad_daily_bias"}, status_code=400)
 -    if direction not in {"buy_only", "sell_only", "both"}:
 -        return JSONResponse({"ok": False, "reason": "bad_direction"}, status_code=400)
-+    return True, "ok"
- 
+-
 -    conn = get_conn()
 -    cur = conn.cursor()
 -    cur.execute("""
@@ -255,11 +267,11 @@ index 2d850bd1b9e62aea9dbe1f8a9d75bc9ba99ec86a..d0dd3fdb5ca2912dd9843d82b68d17dc
 -    """, (h4, h1, daily_bias, direction, now_iso()))
 -    conn.commit()
 -    conn.close()
++    if sl_distance <= 0 or tp_distance <= 0:
++        return False, "non_positive_distance"
  
 -    return {"ok": True, "bias": get_bias_row()}
-+@app.on_event("startup")
-+def startup_event():
-+    init_db()
++    return True, "ok"
  
  
 -@app.post("/webhook")
@@ -268,9 +280,12 @@ index 2d850bd1b9e62aea9dbe1f8a9d75bc9ba99ec86a..d0dd3fdb5ca2912dd9843d82b68d17dc
 -        data = await req.json()
 -    except Exception:
 -        return JSONResponse({"ok": False, "reason": "invalid_json"}, status_code=400)
--
++@app.on_event("startup")
++def startup_event():
++    init_db()
+ 
 -    message_type = str(data.get("message_type", "")).strip()
--
+ 
 -    if message_type == "bias_update":
 -        h4 = str(data.get("h4", "")).strip().lower()
 -        h1 = str(data.get("h1", "")).strip().lower()
@@ -412,13 +427,13 @@ index 2d850bd1b9e62aea9dbe1f8a9d75bc9ba99ec86a..d0dd3fdb5ca2912dd9843d82b68d17dc
  
 -    conn.commit()
      conn.close()
+-
+-    log_webhook(message_type, data, True, "queued")
+-    return {"ok": True, "zones": 1, "daily_plan_sent": True, "zone_id": zone_id}
 +    log_webhook("scalp_signal", data, True, "queued")
 +    return {"status": "scalp_signal_queued", "signal_id": signal_id}
  
--    log_webhook(message_type, data, True, "queued")
--    return {"ok": True, "zones": 1, "daily_plan_sent": True, "zone_id": zone_id}
  
--
 -@app.get("/next_planner_signal")
 -def next_planner_signal():
 +@app.get("/next_signal")
@@ -490,15 +505,15 @@ index 2d850bd1b9e62aea9dbe1f8a9d75bc9ba99ec86a..d0dd3fdb5ca2912dd9843d82b68d17dc
 +    row = cur.fetchone()
      conn.close()
 -    return {"status": "processed", "signal_id": signal_id}
-+
+ 
 +    if not row:
 +        return {"status": "not_found", "signal_id": signal_id}
 +
 +    return {"status": "already_processed", "signal_id": signal_id}
  
- 
 -@app.get("/report")
 -def report():
++
 +@app.get("/signals_report")
 +def signals_report():
      conn = get_conn()
